@@ -1,14 +1,9 @@
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+// In-memory storage (persists during runtime, not across redeploys)
+const dataStore = {};
 
 const server = http.createServer((req, res) => {
     // Enable CORS
@@ -26,67 +21,120 @@ const server = http.createServer((req, res) => {
 
     // GET / - Health check and list available data
     if (req.method === 'GET' && url.pathname === '/') {
-        const files = fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : [];
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'running',
-            message: 'Local API Server for GTM Blueprint Research Data',
+            message: 'GTM Blueprint Research Data API',
             endpoints: {
                 'POST /data/:name': 'Push research data (JSON body)',
                 'GET /data/:name': 'Retrieve research data',
-                'GET /data': 'List all stored data files'
+                'GET /data': 'List all stored data',
+                'GET /all': 'Get all stored data in one response'
             },
-            stored_files: files
+            stored_keys: Object.keys(dataStore),
+            total_entries: Object.keys(dataStore).length
         }, null, 2));
         return;
     }
 
-    // GET /data - List all stored data
+    // GET /data - List all stored data keys
     if (req.method === 'GET' && url.pathname === '/data') {
-        const files = fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : [];
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ files }, null, 2));
+        res.end(JSON.stringify({
+            keys: Object.keys(dataStore),
+            count: Object.keys(dataStore).length
+        }, null, 2));
         return;
     }
 
-    // GET /data/:name - Retrieve specific data file
-    if (req.method === 'GET' && url.pathname.startsWith('/data/')) {
-        const name = url.pathname.replace('/data/', '');
-        const filePath = path.join(DATA_DIR, `${name}.json`);
+    // GET /all - Get ALL stored data in one response
+    if (req.method === 'GET' && url.pathname === '/all') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(dataStore, null, 2));
+        return;
+    }
 
-        if (fs.existsSync(filePath)) {
-            const data = fs.readFileSync(filePath, 'utf8');
+    // GET /data/:name - Retrieve specific data
+    if (req.method === 'GET' && url.pathname.startsWith('/data/')) {
+        const name = decodeURIComponent(url.pathname.replace('/data/', ''));
+
+        if (dataStore[name]) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(data);
+            res.end(JSON.stringify(dataStore[name], null, 2));
         } else {
             res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `Data file '${name}' not found` }));
+            res.end(JSON.stringify({
+                error: `Data '${name}' not found`,
+                available_keys: Object.keys(dataStore)
+            }));
         }
         return;
     }
 
     // POST /data/:name - Store research data
     if (req.method === 'POST' && url.pathname.startsWith('/data/')) {
-        const name = url.pathname.replace('/data/', '');
-        const filePath = path.join(DATA_DIR, `${name}.json`);
+        const name = decodeURIComponent(url.pathname.replace('/data/', ''));
 
         let body = '';
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
             try {
                 const jsonData = JSON.parse(body);
-                fs.writeFileSync(filePath, JSON.stringify(jsonData, null, 2));
+                dataStore[name] = {
+                    ...jsonData,
+                    _metadata: {
+                        received_at: new Date().toISOString(),
+                        size_bytes: body.length
+                    }
+                };
 
-                console.log(`[${new Date().toISOString()}] Saved: ${name}.json (${body.length} bytes)`);
+                console.log(`[${new Date().toISOString()}] Stored: ${name} (${body.length} bytes)`);
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     success: true,
-                    message: `Data saved as '${name}.json'`,
+                    message: `Data saved as '${name}'`,
                     size: body.length,
-                    path: filePath
+                    total_stored: Object.keys(dataStore).length
                 }));
             } catch (err) {
+                console.error(`[${new Date().toISOString()}] Error parsing JSON:`, err.message);
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid JSON', details: err.message }));
+            }
+        });
+        return;
+    }
+
+    // POST /data - Store with auto-generated key or company_name from body
+    if (req.method === 'POST' && url.pathname === '/data') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const jsonData = JSON.parse(body);
+                const name = jsonData.company_name || `entry_${Date.now()}`;
+
+                dataStore[name] = {
+                    ...jsonData,
+                    _metadata: {
+                        received_at: new Date().toISOString(),
+                        size_bytes: body.length
+                    }
+                };
+
+                console.log(`[${new Date().toISOString()}] Stored: ${name} (${body.length} bytes)`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    message: `Data saved as '${name}'`,
+                    key: name,
+                    size: body.length,
+                    total_stored: Object.keys(dataStore).length
+                }));
+            } catch (err) {
+                console.error(`[${new Date().toISOString()}] Error:`, err.message);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Invalid JSON', details: err.message }));
             }
@@ -96,30 +144,21 @@ const server = http.createServer((req, res) => {
 
     // 404 for unknown routes
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    res.end(JSON.stringify({ error: 'Not found', path: url.pathname }));
 });
 
 server.listen(PORT, () => {
     console.log(`
 ====================================================
-  LOCAL API SERVER RUNNING
+  GTM RESEARCH API - RUNNING ON PORT ${PORT}
 ====================================================
-  URL: http://localhost:${PORT}
-
-  ENDPOINTS:
-  - GET  /           Health check & info
-  - GET  /data       List all stored data files
-  - GET  /data/:name Get specific data file
-  - POST /data/:name Store data (JSON body)
-
-  DATA STORED IN: ${DATA_DIR}
-
-  EXAMPLE USAGE:
-  curl -X POST http://localhost:${PORT}/data/app-research \\
-       -H "Content-Type: application/json" \\
-       -d '{"companies": [...], "research": {...}}'
-
-  Press Ctrl+C to stop
+  Endpoints:
+  - GET  /            Health check & stored keys
+  - GET  /data        List all stored data keys
+  - GET  /all         Get ALL data in one response
+  - GET  /data/:name  Get specific data
+  - POST /data/:name  Store data with key
+  - POST /data        Store data (uses company_name as key)
 ====================================================
 `);
 });
